@@ -1,24 +1,16 @@
 // ============================================================================
 // Moo — Invisible Boombox Plugin for Rust (Oxide/uMod)
-// Author: Viktor AI  |  Requested by Dionysus & partner admin
+// Plays Doja Cat - Mooo! from an invisible boombox attached to the player.
 // ============================================================================
-// A portable invisible boombox that attaches to the admin player and plays
-// Doja Cat - Mooo! (or any configured audio URL). Other players hear the
-// music emanating from the admin's position but cannot see the boombox.
-//
 // Setup:
 //   1. Drop this file into oxide/plugins/
 //   2. Add audio URL to server config:
-//        BoomBox.ServerUrlList "Mooo,https://raw.githubusercontent.com/HeyImDionysus/moo/main/mooo.mp3"
+//        BoomBox.ServerUrlList "Mooo,https://raw.githubusercontent.com/HeyImDionysus/Moo/main/mooo.mp3"
 //   3. Grant permission:  oxide.grant user <steamid> moo.use
 //
 // Commands:
-//   /moo          — Attach the invisible boombox and start playing
-//   /moo.stop     — Stop playback (boombox stays attached)
-//   /moo.play     — Resume playback
-//   /moo.vol 0-10 — Set volume level (0 = silent, 10 = max)
-//   /moo.remove   — Remove the boombox entirely
-//   /moo.stealth  — Toggle stealth mode (hides audio from all other players)
+//   /moo        — Toggle the invisible boombox on/off
+//   /moo.remove — Remove the boombox
 // ============================================================================
 
 using System;
@@ -34,64 +26,18 @@ using Network;
 namespace Oxide.Plugins
 {
     [Info("Moo", "Viktor", "1.0.0")]
-    [Description("Invisible portable boombox that follows the player and plays audio")]
+    [Description("Invisible portable boombox that plays Doja Cat - Mooo!")]
     class Moo : RustPlugin
     {
-        #region Constants
-
         private const string PERM_USE = "moo.use";
         private const string BOOMBOX_PREFAB = "assets/prefabs/voiceaudio/boombox/boombox.deployed.prefab";
-
-        #endregion
-
-        #region Configuration
-
-        private PluginConfig config;
-
-        private class PluginConfig
-        {
-            [JsonProperty("Audio URL (direct .mp3 link)")]
-            public string AudioUrl = "https://raw.githubusercontent.com/HeyImDionysus/moo/main/mooo.mp3";
-
-            [JsonProperty("Default Volume (0.0 - 1.0)")]
-            public float DefaultVolume = 1.0f;
-
-            [JsonProperty("Auto-Play On Attach")]
-            public bool AutoPlay = true;
-
-            [JsonProperty("Boombox Local Offset (x,y,z from player)")]
-            public string BoomboxOffset = "0,1.0,0";
-
-            [JsonProperty("Stealth Mode Default (hide from all players)")]
-            public bool StealthDefault = false;
-
-            [JsonProperty("Follow Update Interval (seconds)")]
-            public float FollowInterval = 0.1f;
-        }
-
-        protected override void LoadDefaultConfig() => config = new PluginConfig();
-
-        protected override void LoadConfig()
-        {
-            base.LoadConfig();
-            try { config = Config.ReadObject<PluginConfig>(); }
-            catch { PrintWarning("Invalid config, loading defaults."); config = new PluginConfig(); }
-            SaveConfig();
-        }
-
-        protected override void SaveConfig() => Config.WriteObject(config);
-
-        #endregion
-
-        #region Data Structures
+        private const string AUDIO_URL = "https://raw.githubusercontent.com/HeyImDionysus/Moo/main/mooo.mp3";
 
         private class MooData
         {
             public BaseEntity boomboxEntity;
             public ulong ownerID;
             public bool isPlaying;
-            public bool isStealth;
-            public float volume;
             public Timer followTimer;
 
             public void Cleanup()
@@ -100,10 +46,6 @@ namespace Oxide.Plugins
                 followTimer = null;
             }
         }
-
-        #endregion
-
-        #region Fields
 
         // Owner steamID → boombox data
         private readonly Dictionary<ulong, MooData> activeMoos = new Dictionary<ulong, MooData>();
@@ -114,15 +56,12 @@ namespace Oxide.Plugins
         // Reflection for BoomBox URL
         private FieldInfo _currentRadioIpField;
 
-        #endregion
-
         #region Lifecycle
 
         private void Init()
         {
             permission.RegisterPermission(PERM_USE, this);
 
-            // Cache reflection for BoomBox URL control
             _currentRadioIpField = typeof(BoomBox).GetField("CurrentRadioIp",
                 BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
             if (_currentRadioIpField == null)
@@ -163,85 +102,28 @@ namespace Oxide.Plugins
                 return;
             }
 
-            // If already has one, inform them
             if (activeMoos.TryGetValue(player.userID, out var existing))
             {
                 if (existing.boomboxEntity != null && !existing.boomboxEntity.IsDestroyed)
                 {
-                    // Toggle play/stop instead
+                    // Toggle play/stop
                     if (existing.isPlaying)
                     {
                         StopAudio(existing);
-                        player.ChatMessage("<color=#FFD700>🐄 Moo paused! Use /moo.play to resume or /moo.remove to remove.</color>");
+                        player.ChatMessage("<color=#FFD700>🐄 Moo stopped.</color>");
                     }
                     else
                     {
                         StartAudio(existing);
-                        player.ChatMessage("<color=#FFD700>🐄 Moo resumed!</color>");
+                        player.ChatMessage("<color=#FFD700>🐄 Mooo! Playing...</color>");
                     }
                     return;
                 }
-                // Old one destroyed, clean up
                 DestroyMoo(existing);
                 activeMoos.Remove(player.userID);
             }
 
-            // Spawn new boombox
             SpawnMoo(player);
-        }
-
-        [ChatCommand("moo.play")]
-        private void CmdMooPlay(BasePlayer player, string command, string[] args)
-        {
-            if (!HasMoo(player, out var data)) return;
-
-            StartAudio(data);
-            player.ChatMessage("<color=#FFD700>🐄 Mooo! Playing...</color>");
-        }
-
-        [ChatCommand("moo.stop")]
-        private void CmdMooStop(BasePlayer player, string command, string[] args)
-        {
-            if (!HasMoo(player, out var data)) return;
-
-            StopAudio(data);
-            player.ChatMessage("<color=#FFD700>🐄 Moo stopped.</color>");
-        }
-
-        [ChatCommand("moo.vol")]
-        private void CmdMooVolume(BasePlayer player, string command, string[] args)
-        {
-            if (!HasMoo(player, out var data)) return;
-
-            if (args.Length == 0)
-            {
-                player.ChatMessage($"<color=#FFD700>🐄 Current volume: {data.volume * 10:F0}/10. Usage: /moo.vol 0-10</color>");
-                return;
-            }
-
-            if (!float.TryParse(args[0], out float level) || level < 0 || level > 10)
-            {
-                player.ChatMessage("<color=#ff4444>Volume must be a number from 0 to 10.</color>");
-                return;
-            }
-
-            data.volume = level / 10f;
-            ApplyVolume(data);
-            player.ChatMessage($"<color=#FFD700>🐄 Volume set to {level:F0}/10</color>");
-        }
-
-        [ChatCommand("moo.stealth")]
-        private void CmdMooStealth(BasePlayer player, string command, string[] args)
-        {
-            if (!HasMoo(player, out var data)) return;
-
-            data.isStealth = !data.isStealth;
-
-            if (data.boomboxEntity != null)
-                data.boomboxEntity.SendNetworkUpdateImmediate();
-
-            string state = data.isStealth ? "ON — only you can hear it" : "OFF — everyone nearby can hear it";
-            player.ChatMessage($"<color=#FFD700>🐄 Stealth mode: {state}</color>");
         }
 
         [ChatCommand("moo.remove")]
@@ -268,27 +150,23 @@ namespace Oxide.Plugins
 
         private void SpawnMoo(BasePlayer player)
         {
-            var offset = ParseVector3(config.BoomboxOffset, new Vector3(0f, 1.0f, 0f));
+            var offset = new Vector3(0f, 1.0f, 0f);
             var pos = player.transform.position + offset;
 
-            // Spawn boombox entity
             var boomboxEntity = GameManager.server.CreateEntity(BOOMBOX_PREFAB, pos);
             if (boomboxEntity == null)
             {
-                player.ChatMessage("<color=#ff4444>Failed to spawn boombox. Check server logs.</color>");
+                player.ChatMessage("<color=#ff4444>Failed to spawn boombox.</color>");
                 return;
             }
 
             boomboxEntity.OwnerID = player.userID;
-
-            // Parent to the player so it follows them automatically
             boomboxEntity.SetParent(player, "");
             boomboxEntity.transform.localPosition = offset;
             boomboxEntity.transform.localRotation = Quaternion.identity;
-
             boomboxEntity.Spawn();
 
-            // Disable ground checks so it doesn't destroy itself
+            // Disable ground checks
             var gw = boomboxEntity.GetComponent<GroundWatch>();
             if (gw != null) UnityEngine.Object.Destroy(gw);
             var dgm = boomboxEntity.GetComponent<DestroyOnGroundMissing>();
@@ -303,9 +181,7 @@ namespace Oxide.Plugins
             {
                 boomboxEntity = boomboxEntity,
                 ownerID = player.userID,
-                isPlaying = false,
-                isStealth = config.StealthDefault,
-                volume = config.DefaultVolume
+                isPlaying = false
             };
 
             // Register for CanNetworkTo
@@ -314,15 +190,13 @@ namespace Oxide.Plugins
 
             activeMoos[player.userID] = data;
 
-            // Power the boombox — set the power flag so it can play
+            // Power and play
             NextTick(() =>
             {
                 if (boomboxEntity == null || boomboxEntity.IsDestroyed) return;
 
-                // Set Reserved8 flag = "has power" for IOEntity-based entities
                 boomboxEntity.SetFlag(BaseEntity.Flags.Reserved8, true);
 
-                // Also ensure any IOEntity power state is satisfied
                 var ioEntity = boomboxEntity as IOEntity;
                 if (ioEntity != null)
                 {
@@ -330,27 +204,15 @@ namespace Oxide.Plugins
                     ioEntity.SendNetworkUpdateImmediate();
                 }
 
-                // Apply volume
-                ApplyVolume(data);
-
-                // Auto-play if configured
-                if (config.AutoPlay)
-                {
-                    StartAudio(data);
-                    player.ChatMessage("<size=18><color=#FFD700>🐄 \"Mooo!\" — Boombox attached and playing!</color></size>");
-                    player.ChatMessage("<color=#aaaaaa>Commands: /moo (toggle), /moo.stop, /moo.play, /moo.vol 0-10, /moo.stealth, /moo.remove</color>");
-                }
-                else
-                {
-                    player.ChatMessage("<size=18><color=#FFD700>🐄 Moo boombox attached!</color></size>");
-                    player.ChatMessage("<color=#aaaaaa>Use /moo.play to start. Commands: /moo.stop, /moo.vol 0-10, /moo.stealth, /moo.remove</color>");
-                }
+                StartAudio(data);
+                player.ChatMessage("<size=18><color=#FFD700>🐄 Mooo!</color></size>");
+                player.ChatMessage("<color=#aaaaaa>/moo to toggle, /moo.remove to remove</color>");
 
                 Puts($"[Moo] {player.displayName} attached a Moo boombox");
             });
 
-            // Start a follow timer as fallback (in case parenting doesn't stick on respawn)
-            data.followTimer = timer.Every(config.FollowInterval, () =>
+            // Follow timer (re-parent if detached, keep power on)
+            data.followTimer = timer.Every(0.1f, () =>
             {
                 if (boomboxEntity == null || boomboxEntity.IsDestroyed)
                 {
@@ -359,7 +221,6 @@ namespace Oxide.Plugins
                     return;
                 }
 
-                // Re-parent if detached
                 if (boomboxEntity.GetParentEntity() == null || boomboxEntity.GetParentEntity() != player)
                 {
                     if (player != null && player.IsConnected && !player.IsDead())
@@ -371,11 +232,9 @@ namespace Oxide.Plugins
                     }
                 }
 
-                // Keep power on
                 if (!boomboxEntity.HasFlag(BaseEntity.Flags.Reserved8))
                     boomboxEntity.SetFlag(BaseEntity.Flags.Reserved8, true);
 
-                // Keep health full
                 var cb = boomboxEntity as BaseCombatEntity;
                 if (cb != null && cb.health < cb.MaxHealth())
                     cb.SetHealth(cb.MaxHealth());
@@ -386,47 +245,31 @@ namespace Oxide.Plugins
         {
             data.Cleanup();
 
-            // Unregister from lookup
             if (data.boomboxEntity?.net != null)
                 entityLookup.Remove(data.boomboxEntity.net.ID);
 
-            // Kill the entity
             if (data.boomboxEntity != null && !data.boomboxEntity.IsDestroyed)
                 data.boomboxEntity.Kill();
         }
 
         #endregion
 
-        #region Visibility Hook
+        #region Hooks
 
         private object CanNetworkTo(BaseNetworkable entity, BasePlayer player)
         {
             if (entity?.net == null || player == null) return null;
-
-            // Fast exit for non-moo entities
             if (!entityLookup.TryGetValue(entity.net.ID, out var data)) return null;
 
-            // Owner always sees it (well, it's invisible anyway but they "have" it)
-            if (player.userID == data.ownerID) return null;
-
-            // In stealth mode, hide from everyone (audio won't play for them either)
-            if (data.isStealth) return false;
-
-            // Normal mode: entity is networked to nearby players (they hear audio)
-            // but visually the boombox is hidden inside the player model
-            // We let it network so others can hear the audio
+            // Everyone can hear it (boombox hidden inside player model)
             return null;
         }
-
-        #endregion
-
-        #region Hooks — Protection
 
         private object OnEntityTakeDamage(BaseCombatEntity entity, HitInfo info)
         {
             if (entity?.net == null) return null;
             if (entityLookup.ContainsKey(entity.net.ID))
-                return true; // Block all damage to moo boomboxes
+                return true;
             return null;
         }
 
@@ -434,20 +277,18 @@ namespace Oxide.Plugins
         {
             if (entity?.net == null) return null;
             if (entityLookup.ContainsKey(entity.net.ID))
-                return true; // Prevent decay
+                return true;
             return null;
         }
 
-        // Prevent other players from picking up or interacting with the boombox
         private object CanPickupEntity(BasePlayer player, BaseEntity entity)
         {
             if (entity?.net == null || player == null) return null;
             if (entityLookup.ContainsKey(entity.net.ID))
-                return false; // Block pickup
+                return false;
             return null;
         }
 
-        // Prevent looting the boombox
         private object CanLootEntity(BasePlayer player, BaseEntity entity)
         {
             if (entity?.net == null || player == null) return null;
@@ -456,23 +297,15 @@ namespace Oxide.Plugins
             return null;
         }
 
-        #endregion
-
-        #region Hooks — Player Death / Respawn
-
         private void OnPlayerDeath(BasePlayer player, HitInfo info)
         {
             if (player == null) return;
             if (!activeMoos.TryGetValue(player.userID, out var data)) return;
 
-            // Stop audio on death but keep the data
             StopAudio(data);
-
-            // Detach boombox temporarily
             if (data.boomboxEntity != null && !data.boomboxEntity.IsDestroyed)
             {
                 data.boomboxEntity.SetParent(null);
-                // Move it underground temporarily so it's out of the way
                 data.boomboxEntity.transform.position = new Vector3(0, -500f, 0);
                 data.boomboxEntity.SendNetworkUpdateImmediate();
             }
@@ -483,10 +316,9 @@ namespace Oxide.Plugins
             if (player == null) return;
             if (!activeMoos.TryGetValue(player.userID, out var data)) return;
 
-            // Re-attach boombox after respawn
             if (data.boomboxEntity != null && !data.boomboxEntity.IsDestroyed)
             {
-                var offset = ParseVector3(config.BoomboxOffset, new Vector3(0f, 1.0f, 0f));
+                var offset = new Vector3(0f, 1.0f, 0f);
 
                 timer.Once(1f, () =>
                 {
@@ -502,14 +334,14 @@ namespace Oxide.Plugins
                     if (data.isPlaying)
                         StartAudio(data);
 
-                    player.ChatMessage("<color=#FFD700>🐄 Moo boombox re-attached!</color>");
+                    player.ChatMessage("<color=#FFD700>🐄 Moo re-attached!</color>");
                 });
             }
         }
 
         #endregion
 
-        #region Audio System
+        #region Audio
 
         private void StartAudio(MooData data)
         {
@@ -521,19 +353,14 @@ namespace Oxide.Plugins
             try
             {
                 var controller = deployable.BoxController;
-                if (controller == null)
-                {
-                    PrintWarning("[Moo] BoomBox controller is null");
-                    return;
-                }
+                if (controller == null) return;
 
-                // Ensure power flag is set
                 data.boomboxEntity.SetFlag(BaseEntity.Flags.Reserved8, true);
 
-                // Set the URL
-                SetBoomboxUrl(controller, config.AudioUrl);
+                if (_currentRadioIpField != null)
+                    _currentRadioIpField.SetValue(controller, AUDIO_URL);
 
-                // Start playback
+                controller.baseEntity?.SendNetworkUpdateImmediate();
                 controller.ServerTogglePlay(true);
                 data.isPlaying = true;
             }
@@ -562,90 +389,6 @@ namespace Oxide.Plugins
             {
                 PrintWarning($"[Moo] Failed to stop audio: {ex.Message}");
             }
-        }
-
-        private void ApplyVolume(MooData data)
-        {
-            if (data.boomboxEntity == null || data.boomboxEntity.IsDestroyed) return;
-
-            var deployable = data.boomboxEntity as DeployableBoomBox;
-            if (deployable == null) return;
-
-            try
-            {
-                var controller = deployable.BoxController;
-                if (controller == null) return;
-
-                // BoomBox has a HeldBoomBox parent with volume, but for deployed
-                // boombox, we adjust the audio source radius via the controller.
-                // The `BaseVolumeLevel` field controls volume in newer Rust.
-                var volumeField = typeof(BoomBox).GetField("BaseVolumeLevel",
-                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                if (volumeField != null)
-                {
-                    volumeField.SetValue(controller, data.volume);
-                }
-
-                // Also try the newer property approach
-                var volumeProp = typeof(BoomBox).GetProperty("CurrentVolume",
-                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                if (volumeProp != null && volumeProp.CanWrite)
-                {
-                    volumeProp.SetValue(controller, data.volume);
-                }
-
-                controller.baseEntity.SendNetworkUpdate();
-            }
-            catch (Exception ex)
-            {
-                PrintWarning($"[Moo] Failed to set volume: {ex.Message}");
-            }
-        }
-
-        private void SetBoomboxUrl(BoomBox controller, string url)
-        {
-            if (_currentRadioIpField != null)
-            {
-                _currentRadioIpField.SetValue(controller, url);
-            }
-
-            // Notify clients of URL change
-            controller.baseEntity?.SendNetworkUpdateImmediate();
-        }
-
-        #endregion
-
-        #region Helpers
-
-        private bool HasMoo(BasePlayer player, out MooData data)
-        {
-            data = null;
-            if (!permission.UserHasPermission(player.UserIDString, PERM_USE))
-            {
-                player.ChatMessage("<color=#ff4444>You don't have permission to use Moo!</color>");
-                return false;
-            }
-
-            if (!activeMoos.TryGetValue(player.userID, out data) ||
-                data.boomboxEntity == null || data.boomboxEntity.IsDestroyed)
-            {
-                player.ChatMessage("<color=#ff4444>You don't have an active Moo boombox. Use /moo to attach one.</color>");
-                return false;
-            }
-
-            return true;
-        }
-
-        private Vector3 ParseVector3(string input, Vector3 fallback)
-        {
-            try
-            {
-                var parts = input.Split(',');
-                if (parts.Length == 3)
-                    return new Vector3(float.Parse(parts[0]), float.Parse(parts[1]), float.Parse(parts[2]));
-            }
-            catch { }
-            return fallback;
         }
 
         #endregion
