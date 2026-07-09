@@ -594,7 +594,7 @@ namespace Oxide.Plugins
                     volumeProp.SetValue(controller, data.volume);
                 }
 
-                controller.SendNetworkUpdate();
+                controller.baseEntity.SendNetworkUpdate();
             }
             catch (Exception ex)
             {
@@ -610,7 +610,7 @@ namespace Oxide.Plugins
             }
 
             // Notify clients of URL change
-            controller.baseEntity?.ClientRPC<string>(null, "OnRadioIPChanged", url);
+            controller.baseEntity?.SendNetworkUpdateImmediate();
         }
 
         #endregion
