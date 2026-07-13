@@ -29,7 +29,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("Moo", "Viktor", "1.0.0")]
+    [Info("Moo", "Viktor", "1.1.0")]
     [Description("Invisible portable boombox that plays Doja Cat - Mooo!")]
     class Moo : RustPlugin
     {
@@ -37,6 +37,7 @@ namespace Oxide.Plugins
         private const string BOOMBOX_PREFAB = "assets/prefabs/voiceaudio/boombox/boombox.deployed.prefab";
         private const string AUDIO_URL = "https://raw.githubusercontent.com/HeyImDionysus/Moo/main/mooo.mp3";
         private static readonly Vector3 BOOMBOX_OFFSET = new Vector3(0f, 1.0f, 0f);
+        private static readonly Vector3 INVISIBLE_SCALE = new Vector3(0.001f, 0.001f, 0.001f);
 
         #region Data
 
@@ -59,7 +60,11 @@ namespace Oxide.Plugins
         // Owner steamID → boombox data
         private readonly Dictionary<ulong, MooData> activeMoos = new Dictionary<ulong, MooData>();
 
-        private readonly HashSet<ulong> mooEntityOwners = new HashSet<ulong>();
+        // Net IDs of all active moo boomboxes (for protection hooks)
+        private readonly HashSet<uint> _mooNetIds = new HashSet<uint>();
+
+        // Net IDs of boomboxes in stealth mode (for CanNetworkTo fast-path)
+        private readonly HashSet<uint> _stealthNetIds = new HashSet<uint>();
 
         // Reflection for BoomBox URL
         private FieldInfo _currentRadioIpField;
@@ -86,7 +91,8 @@ namespace Oxide.Plugins
             foreach (var kvp in activeMoos.ToList())
                 DestroyMoo(kvp.Value);
             activeMoos.Clear();
-            mooEntityOwners.Clear();
+            _mooNetIds.Clear();
+            _stealthNetIds.Clear();
         }
 
         private void OnPlayerDisconnected(BasePlayer player, string reason)
@@ -101,6 +107,19 @@ namespace Oxide.Plugins
 
         #endregion
 
+        #region Chat Messaging
+
+        /// <summary>
+        /// Send a chat message to the player with "Moo" as the sender name
+        /// instead of the default "?" that appears when using ChatMessage().
+        /// </summary>
+        private void SendMooMessage(BasePlayer player, string message)
+        {
+            player.SendConsoleCommand("chat.add", 2, 0, message, "Moo");
+        }
+
+        #endregion
+
         #region Chat Commands
 
         [ChatCommand("moo")]
@@ -108,7 +127,7 @@ namespace Oxide.Plugins
         {
             if (!permission.UserHasPermission(player.UserIDString, PERM_USE))
             {
-                player.ChatMessage("<color=#ff4444>You don't have permission to use Moo!</color>");
+                SendMooMessage(player, "<color=#ff4444>You don't have permission to use Moo!</color>");
                 return;
             }
 
@@ -119,12 +138,12 @@ namespace Oxide.Plugins
                     if (existing.isPlaying)
                     {
                         StopAudio(existing);
-                        player.ChatMessage("<color=#FFD700>🐄 Moo paused! Use /moo.play to resume or /moo.remove to remove.</color>");
+                        SendMooMessage(player, "<color=#FFD700>🐄 Moo paused! Use /moo.play to resume or /moo.remove to remove.</color>");
                     }
                     else
                     {
                         StartAudio(existing);
-                        player.ChatMessage("<color=#FFD700>🐄 Mooo! Playing...</color>");
+                        SendMooMessage(player, "<color=#FFD700>🐄 Mooo! Playing...</color>");
                     }
                     return;
                 }
@@ -140,7 +159,7 @@ namespace Oxide.Plugins
         {
             if (!HasMoo(player, out var data)) return;
             StartAudio(data);
-            player.ChatMessage("<color=#FFD700>🐄 Mooo! Playing...</color>");
+            SendMooMessage(player, "<color=#FFD700>🐄 Mooo! Playing...</color>");
         }
 
         [ChatCommand("moo.stop")]
@@ -148,7 +167,7 @@ namespace Oxide.Plugins
         {
             if (!HasMoo(player, out var data)) return;
             StopAudio(data);
-            player.ChatMessage("<color=#FFD700>🐄 Moo stopped.</color>");
+            SendMooMessage(player, "<color=#FFD700>🐄 Moo stopped.</color>");
         }
 
         [ChatCommand("moo.vol")]
@@ -158,19 +177,19 @@ namespace Oxide.Plugins
 
             if (args.Length == 0)
             {
-                player.ChatMessage($"<color=#FFD700>🐄 Current volume: {data.volume * 10:F0}/10. Usage: /moo.vol 0-10</color>");
+                SendMooMessage(player, $"<color=#FFD700>🐄 Current volume: {data.volume * 10:F0}/10. Usage: /moo.vol 0-10</color>");
                 return;
             }
 
             if (!float.TryParse(args[0], out float level) || level < 0 || level > 10)
             {
-                player.ChatMessage("<color=#ff4444>Volume must be a number from 0 to 10.</color>");
+                SendMooMessage(player, "<color=#ff4444>Volume must be a number from 0 to 10.</color>");
                 return;
             }
 
             data.volume = level / 10f;
             ApplyVolume(data);
-            player.ChatMessage($"<color=#FFD700>🐄 Volume set to {level:F0}/10</color>");
+            SendMooMessage(player, $"<color=#FFD700>🐄 Volume set to {level:F0}/10</color>");
         }
 
         [ChatCommand("moo.stealth")]
@@ -180,11 +199,21 @@ namespace Oxide.Plugins
 
             data.isStealth = !data.isStealth;
 
+            // Update stealth tracking set for CanNetworkTo fast-path
+            if (data.boomboxEntity?.net != null)
+            {
+                uint netId = data.boomboxEntity.net.ID.Value;
+                if (data.isStealth)
+                    _stealthNetIds.Add(netId);
+                else
+                    _stealthNetIds.Remove(netId);
+            }
+
             if (data.boomboxEntity != null)
                 data.boomboxEntity.SendNetworkUpdateImmediate();
 
             string state = data.isStealth ? "ON — only you can hear it" : "OFF — everyone nearby can hear it";
-            player.ChatMessage($"<color=#FFD700>🐄 Stealth mode: {state}</color>");
+            SendMooMessage(player, $"<color=#FFD700>🐄 Stealth mode: {state}</color>");
         }
 
         [ChatCommand("moo.remove")]
@@ -197,11 +226,11 @@ namespace Oxide.Plugins
             {
                 DestroyMoo(data);
                 activeMoos.Remove(player.userID);
-                player.ChatMessage("<color=#FFD700>🐄 Moo removed!</color>");
+                SendMooMessage(player, "<color=#FFD700>🐄 Moo removed!</color>");
             }
             else
             {
-                player.ChatMessage("<color=#ff4444>You don't have an active Moo boombox.</color>");
+                SendMooMessage(player, "<color=#ff4444>You don't have an active Moo boombox.</color>");
             }
         }
 
@@ -216,14 +245,16 @@ namespace Oxide.Plugins
             var boomboxEntity = GameManager.server.CreateEntity(BOOMBOX_PREFAB, pos);
             if (boomboxEntity == null)
             {
-                player.ChatMessage("<color=#ff4444>Failed to spawn boombox.</color>");
+                SendMooMessage(player, "<color=#ff4444>Failed to spawn boombox.</color>");
                 return;
             }
 
             boomboxEntity.OwnerID = player.userID;
+            boomboxEntity.enableSaving = false;
             boomboxEntity.SetParent(player, "");
             boomboxEntity.transform.localPosition = BOOMBOX_OFFSET;
             boomboxEntity.transform.localRotation = Quaternion.identity;
+            boomboxEntity.transform.localScale = INVISIBLE_SCALE;
             boomboxEntity.Spawn();
 
             // Disable ground checks
@@ -247,7 +278,7 @@ namespace Oxide.Plugins
             };
 
             if (boomboxEntity.net != null)
-                mooEntityOwners.Add(data.ownerID);
+                _mooNetIds.Add(boomboxEntity.net.ID.Value);
 
             activeMoos[player.userID] = data;
 
@@ -266,14 +297,14 @@ namespace Oxide.Plugins
                 }
 
                 StartAudio(data);
-                player.ChatMessage("<size=18><color=#FFD700>🐄 Mooo! — Boombox attached and playing!</color></size>");
-                player.ChatMessage("<color=#aaaaaa>Commands: /moo (toggle), /moo.stop, /moo.play, /moo.vol 0-10, /moo.stealth, /moo.remove</color>");
+                SendMooMessage(player, "<size=18><color=#FFD700>🐄 Mooo! — Boombox attached and playing!</color></size>");
+                SendMooMessage(player, "<color=#aaaaaa>Commands: /moo (toggle), /moo.stop, /moo.play, /moo.vol 0-10, /moo.stealth, /moo.remove</color>");
 
                 Puts($"[Moo] {player.displayName} attached a Moo boombox");
             });
 
-            // Follow timer — re-parent if detached, keep power on
-            data.followTimer = timer.Every(0.1f, () =>
+            // Follow timer — safety net to re-parent if detached (runs every 2s instead of 0.1s)
+            data.followTimer = timer.Every(2f, () =>
             {
                 if (boomboxEntity == null || boomboxEntity.IsDestroyed)
                 {
@@ -282,23 +313,37 @@ namespace Oxide.Plugins
                     return;
                 }
 
-                if (boomboxEntity.GetParentEntity() == null || boomboxEntity.GetParentEntity() != player)
+                bool needsUpdate = false;
+
+                // Only re-parent if actually detached
+                var parent = boomboxEntity.GetParentEntity();
+                if (parent != player)
                 {
                     if (player != null && player.IsConnected && !player.IsDead())
                     {
                         boomboxEntity.SetParent(player, "");
                         boomboxEntity.transform.localPosition = BOOMBOX_OFFSET;
                         boomboxEntity.transform.localRotation = Quaternion.identity;
-                        boomboxEntity.SendNetworkUpdateImmediate();
+                        boomboxEntity.transform.localScale = INVISIBLE_SCALE;
+                        needsUpdate = true;
                     }
                 }
 
+                // Ensure power stays on
                 if (!boomboxEntity.HasFlag(BaseEntity.Flags.Reserved8))
+                {
                     boomboxEntity.SetFlag(BaseEntity.Flags.Reserved8, true);
+                    needsUpdate = true;
+                }
 
+                // Keep health topped up
                 var cb = boomboxEntity as BaseCombatEntity;
                 if (cb != null && cb.health < cb.MaxHealth())
                     cb.SetHealth(cb.MaxHealth());
+
+                // Only send a network update if something actually changed
+                if (needsUpdate)
+                    boomboxEntity.SendNetworkUpdateImmediate();
             });
         }
 
@@ -307,7 +352,10 @@ namespace Oxide.Plugins
             data.Cleanup();
 
             if (data.boomboxEntity?.net != null)
-                mooEntityOwners.Remove(data.ownerID);
+            {
+                _mooNetIds.Remove(data.boomboxEntity.net.ID.Value);
+                _stealthNetIds.Remove(data.boomboxEntity.net.ID.Value);
+            }
 
             if (data.boomboxEntity != null && !data.boomboxEntity.IsDestroyed)
                 data.boomboxEntity.Kill();
@@ -315,23 +363,23 @@ namespace Oxide.Plugins
 
         #endregion
 
-        #region Hooks — Visibility
+        #region Hooks — Visibility (Stealth only)
 
         private object CanNetworkTo(BaseNetworkable entity, BasePlayer player)
         {
-            if (entity?.net == null || player == null) return null;
+            // Fast exit: if nothing is in stealth, skip all work immediately
+            if (_stealthNetIds.Count == 0) return null;
+            if (entity?.net == null) return null;
+
+            // Only process entities we're actively tracking as stealth
+            if (!_stealthNetIds.Contains(entity.net.ID.Value)) return null;
+
             var baseEnt = entity as BaseEntity;
-            if (baseEnt == null || !mooEntityOwners.Contains(baseEnt.OwnerID)) return null;
-            if (!activeMoos.TryGetValue(baseEnt.OwnerID, out var data)) return null;
+            if (baseEnt == null) return null;
 
-            // Owner always gets it
-            if (player.userID == data.ownerID) return null;
-
-            // Stealth: hide from everyone else
-            if (data.isStealth) return false;
-
-            // Normal: networked to all (everyone hears audio)
-            return null;
+            // Stealth: owner always receives (hears audio); everyone else is blocked
+            if (player.userID == baseEnt.OwnerID) return null;
+            return false;
         }
 
         #endregion
@@ -340,32 +388,32 @@ namespace Oxide.Plugins
 
         private object OnEntityTakeDamage(BaseCombatEntity entity, HitInfo info)
         {
-            if (entity == null) return null;
-            if (mooEntityOwners.Contains(entity.OwnerID) && activeMoos.ContainsKey(entity.OwnerID))
+            if (entity?.net == null) return null;
+            if (_mooNetIds.Contains(entity.net.ID.Value))
                 return true;
             return null;
         }
 
         private object OnEntityDecay(BaseCombatEntity entity)
         {
-            if (entity == null) return null;
-            if (mooEntityOwners.Contains(entity.OwnerID) && activeMoos.ContainsKey(entity.OwnerID))
+            if (entity?.net == null) return null;
+            if (_mooNetIds.Contains(entity.net.ID.Value))
                 return true;
             return null;
         }
 
         private object CanPickupEntity(BasePlayer player, BaseEntity entity)
         {
-            if (entity == null || player == null) return null;
-            if (mooEntityOwners.Contains(entity.OwnerID) && activeMoos.ContainsKey(entity.OwnerID))
+            if (entity?.net == null || player == null) return null;
+            if (_mooNetIds.Contains(entity.net.ID.Value))
                 return false;
             return null;
         }
 
         private object CanLootEntity(BasePlayer player, BaseEntity entity)
         {
-            if (entity == null || player == null) return null;
-            if (mooEntityOwners.Contains(entity.OwnerID) && activeMoos.ContainsKey(entity.OwnerID))
+            if (entity?.net == null || player == null) return null;
+            if (_mooNetIds.Contains(entity.net.ID.Value))
                 return false;
             return null;
         }
@@ -403,13 +451,14 @@ namespace Oxide.Plugins
                     data.boomboxEntity.SetParent(player, "");
                     data.boomboxEntity.transform.localPosition = BOOMBOX_OFFSET;
                     data.boomboxEntity.transform.localRotation = Quaternion.identity;
+                    data.boomboxEntity.transform.localScale = INVISIBLE_SCALE;
                     data.boomboxEntity.SetFlag(BaseEntity.Flags.Reserved8, true);
                     data.boomboxEntity.SendNetworkUpdateImmediate();
 
                     if (data.isPlaying)
                         StartAudio(data);
 
-                    player.ChatMessage("<color=#FFD700>🐄 Moo re-attached!</color>");
+                    SendMooMessage(player, "<color=#FFD700>🐄 Moo re-attached!</color>");
                 });
             }
         }
@@ -505,14 +554,14 @@ namespace Oxide.Plugins
             data = null;
             if (!permission.UserHasPermission(player.UserIDString, PERM_USE))
             {
-                player.ChatMessage("<color=#ff4444>You don't have permission to use Moo!</color>");
+                SendMooMessage(player, "<color=#ff4444>You don't have permission to use Moo!</color>");
                 return false;
             }
 
             if (!activeMoos.TryGetValue(player.userID, out data) ||
                 data.boomboxEntity == null || data.boomboxEntity.IsDestroyed)
             {
-                player.ChatMessage("<color=#ff4444>You don't have an active Moo boombox. Use /moo to attach one.</color>");
+                SendMooMessage(player, "<color=#ff4444>You don't have an active Moo boombox. Use /moo to attach one.</color>");
                 return false;
             }
 
